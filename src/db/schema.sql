@@ -197,3 +197,21 @@ CREATE TABLE IF NOT EXISTS settings (
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS gst_default_rate NUMERIC(5, 2) NOT NULL DEFAULT 0;
 
 INSERT INTO settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- Stores the compressed photo (base64 data URL) captured by the Add/Edit
+-- Product form's file picker. TEXT has no meaningful size ceiling in
+-- Postgres, but this is a pragmatic choice for a single-store catalog —
+-- moving to object storage (S3/Cloudinary) with just a URL here would be
+-- the sturdier path if the catalog grows much larger.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS image TEXT;
+
+-- purchase_items originally used ON DELETE RESTRICT (and NOT NULL) on
+-- product_id, which blocks deleting any product that has ever appeared on
+-- a purchase bill with a hard 500 error. sale_items already solves this
+-- correctly with ON DELETE SET NULL (product_name is stored separately as
+-- a text snapshot, so historical records stay meaningful either way) —
+-- this brings purchase_items in line with that same, already-proven fix.
+ALTER TABLE purchase_items ALTER COLUMN product_id DROP NOT NULL;
+ALTER TABLE purchase_items DROP CONSTRAINT IF EXISTS purchase_items_product_id_fkey;
+ALTER TABLE purchase_items ADD CONSTRAINT purchase_items_product_id_fkey
+  FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL;

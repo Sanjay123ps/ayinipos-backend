@@ -4,6 +4,16 @@ import { findOrCreateCustomer } from './customerModel.js'
 
 const CREDIT_CLOSE_MODES = ['Cash', 'Card', 'UPI']
 
+// Ayini is a single shop in Coimbatore, so "today"/"this month" and the
+// trend chart's day buckets below are anchored to IST explicitly via
+// `AT TIME ZONE`, rather than Postgres's session timezone — which defaults
+// to UTC on most managed hosts (Railway included). Without this, the same
+// class of bug fixed in getBillHistory's `to` filter (issue #7) shows up
+// again here: created_at::date / CURRENT_DATE silently use the session
+// timezone, so sales in the first ~5.5 hours of the IST day get bucketed
+// into the previous day.
+const SHOP_TZ = 'Asia/Kolkata'
+
 export async function createSale({ items, discountPercent, customerMobile, customerName, customerAddress, paymentMode }) {
   if (!items || items.length === 0) {
     const err = new Error('A bill needs at least one item')
@@ -16,17 +26,45 @@ export async function createSale({ items, discountPercent, customerMobile, custo
     let gstAmount = 0
     const lines = []
 
+    // SECURITY: price/gst are always re-read from the products table inside
+    // this same transaction — never trusted from the request body. Before
+    // this fix, a client could send any price/gst it liked (e.g. via the
+    // browser's network tab) and the bill would be created for that amount.
+    // `qty` is the one thing we still take from the client, clamped to a
+    // positive number. `FOR UPDATE` locks each product row for the
+    // duration of the transaction so two simultaneous sales of the same
+    // item can't both read stale stock.
     for (const item of items) {
-      const lineSubtotal = item.price * item.qty
-      const lineGst = (lineSubtotal * (item.gst || 0)) / 100
+      const qty = Number(item.qty)
+      if (!Number.isFinite(qty) || qty <= 0) {
+        const err = new Error(`Invalid quantity for product ${item.id}`)
+        err.status = 400
+        throw err
+      }
+
+      const { rows: productRows } = await client.query(
+        'SELECT id, name, price, gst, stock FROM products WHERE id = $1 FOR UPDATE',
+        [item.id]
+      )
+      const product = productRows[0]
+      if (!product) {
+        const err = new Error(`Product ${item.id} not found`)
+        err.status = 400
+        throw err
+      }
+
+      const price = Number(product.price)
+      const gst = Number(product.gst)
+      const lineSubtotal = price * qty
+      const lineGst = (lineSubtotal * gst) / 100
       subtotal += lineSubtotal
       gstAmount += lineGst
       lines.push({
-        productId: item.id,
-        name: item.name,
-        price: item.price,
-        gst: item.gst || 0,
-        qty: item.qty,
+        id: product.id,
+        name: product.name,
+        price,
+        gst,
+        qty,
         lineTotal: lineSubtotal + lineGst,
       })
     }
@@ -55,15 +93,19 @@ export async function createSale({ items, discountPercent, customerMobile, custo
       await client.query(
         `INSERT INTO sale_items (sale_id, product_id, product_name, price, gst, quantity, line_total)
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [saleId, line.productId, line.name, line.price, line.gst, line.qty, line.lineTotal]
+        [saleId, line.id, line.name, line.price, line.gst, line.qty, line.lineTotal]
       )
-      await applyStockDelta(line.productId, -line.qty, `Sale ${billNo}`, client)
+      await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
     }
 
     return {
       id: billNo,
       createdAt: rows[0].created_at,
-      items,
+      // Return the server-resolved lines (real price/gst from the products
+      // table), not the raw request `items` — otherwise a tampered request
+      // would still show its fake price on the receipt even though the
+      // correct amount was the one actually charged and stored.
+      items: lines,
       paymentMode: mode,
       creditStatus,
       customerMobile,
@@ -74,7 +116,7 @@ export async function createSale({ items, discountPercent, customerMobile, custo
         gstAmount: round2(gstAmount),
         discountAmount: round2(discountAmount),
         total: round2(total),
-        itemCount: items.reduce((s, i) => s + i.qty, 0),
+        itemCount: lines.reduce((s, i) => s + i.qty, 0),
       },
     }
   })
@@ -91,8 +133,15 @@ export async function getBillHistory({ from, to, q, page = 1, limit = 25 }) {
     conditions.push(`created_at >= $${params.length}`)
   }
   if (to) {
+    // `to` arrives as a full ISO timestamp marking the end of the last
+    // included local day (see utils/dateRanges.js on the frontend) — a
+    // plain `<=` compares real instants and doesn't depend on Postgres's
+    // session timezone at all, unlike the old `::date + INTERVAL '1 day'`
+    // approach, which interpreted a bare date in the server's session
+    // timezone (UTC) and clipped up to ~5.5 hours of early-morning IST
+    // sales out of "today"'s results.
     params.push(to)
-    conditions.push(`created_at < ($${params.length}::date + INTERVAL '1 day')`)
+    conditions.push(`created_at <= $${params.length}`)
   }
   if (q) {
     params.push(`%${q}%`)
@@ -165,6 +214,42 @@ export async function getBillByNo(billNo) {
 
 // Deletes a bill and restores the stock it had deducted, keeping the
 // stock ledger accurate (mirrors how a sale deducts stock on creation).
+// Deletes several bills at once (History screen multi-select), reversing
+// stock for each in a single transaction so a partial failure can't leave
+// inventory half-restored. Silently skips bill numbers that don't exist.
+export async function bulkDeleteBills(billNumbers) {
+  if (!billNumbers || billNumbers.length === 0) {
+    return { deleted: [], notFound: [] }
+  }
+
+  return withTransaction(async (client) => {
+    const deleted = []
+    const notFound = []
+
+    for (const billNo of billNumbers) {
+      const { rows } = await client.query('SELECT id FROM sales WHERE bill_no = $1', [billNo])
+      if (!rows[0]) {
+        notFound.push(billNo)
+        continue
+      }
+      const saleId = rows[0].id
+
+      const { rows: items } = await client.query(
+        'SELECT product_id, quantity FROM sale_items WHERE sale_id = $1 AND product_id IS NOT NULL',
+        [saleId]
+      )
+      for (const item of items) {
+        await applyStockDelta(item.product_id, item.quantity, `Bill ${billNo} deleted`, client)
+      }
+
+      await client.query('DELETE FROM sales WHERE id = $1', [saleId])
+      deleted.push(billNo)
+    }
+
+    return { deleted, notFound }
+  })
+}
+
 export async function deleteBill(billNo) {
   return withTransaction(async (client) => {
     const { rows } = await client.query('SELECT id FROM sales WHERE bill_no = $1', [billNo])
@@ -205,45 +290,127 @@ export async function getRecentSales(limit = 5) {
   return rows.map((r) => ({ ...r, total: Number(r.total) }))
 }
 
-export async function getDashboardStats() {
+export async function getDashboardStats({ from, to } = {}) {
   const { rows: salesRows } = await pool.query(
     `SELECT
-       COALESCE(SUM(total) FILTER (WHERE created_at::date = CURRENT_DATE), 0) AS today_sales,
-       COALESCE(SUM(total) FILTER (WHERE date_trunc('month', created_at) = date_trunc('month', now())), 0) AS monthly_sales,
+       COALESCE(SUM(total) FILTER (
+         WHERE (created_at AT TIME ZONE '${SHOP_TZ}')::date = (now() AT TIME ZONE '${SHOP_TZ}')::date
+       ), 0) AS today_sales,
+       COALESCE(SUM(total) FILTER (
+         WHERE date_trunc('month', created_at AT TIME ZONE '${SHOP_TZ}')
+             = date_trunc('month', now() AT TIME ZONE '${SHOP_TZ}')
+       ), 0) AS monthly_sales,
+       COALESCE(SUM(total) FILTER (
+         WHERE (created_at AT TIME ZONE '${SHOP_TZ}')::date > (now() AT TIME ZONE '${SHOP_TZ}')::date - 7
+       ), 0) AS week_sales,
+       COALESCE(SUM(total) FILTER (
+         WHERE (created_at AT TIME ZONE '${SHOP_TZ}')::date <= (now() AT TIME ZONE '${SHOP_TZ}')::date - 7
+           AND (created_at AT TIME ZONE '${SHOP_TZ}')::date > (now() AT TIME ZONE '${SHOP_TZ}')::date - 14
+       ), 0) AS previous_week_sales,
        COALESCE(SUM(total), 0) AS total_revenue,
        COUNT(*)::int AS total_orders
      FROM sales`
   )
   const { rows: productRows } = await pool.query('SELECT COUNT(*)::int AS total_products FROM products')
 
+  // Reports page: revenue/orders scoped to the selected Daily/Weekly/
+  // Monthly/Custom range, using the same >=/<= instant comparison as
+  // getBillHistory (safe regardless of session timezone since it's a
+  // straight timestamptz comparison, no date truncation involved). Falls
+  // back to the all-time totals above when no range is given, so the
+  // Dashboard home page — which calls this with no arguments — is
+  // unaffected.
+  let rangeRevenue = Number(salesRows[0].total_revenue)
+  let rangeOrders = salesRows[0].total_orders
+  if (from || to) {
+    const conditions = []
+    const params = []
+    if (from) {
+      params.push(from)
+      conditions.push(`created_at >= $${params.length}`)
+    }
+    if (to) {
+      params.push(to)
+      conditions.push(`created_at <= $${params.length}`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const { rows: rangeRows } = await pool.query(
+      `SELECT COALESCE(SUM(total), 0) AS revenue, COUNT(*)::int AS orders FROM sales ${where}`,
+      params
+    )
+    rangeRevenue = Number(rangeRows[0].revenue)
+    rangeOrders = rangeRows[0].orders
+  }
+
   return {
     todaySales: Number(salesRows[0].today_sales),
     monthlySales: Number(salesRows[0].monthly_sales),
+    weekSales: Number(salesRows[0].week_sales),
+    previousWeekSales: Number(salesRows[0].previous_week_sales),
     totalOrders: salesRows[0].total_orders,
     totalProducts: productRows[0].total_products,
     totalRevenue: Number(salesRows[0].total_revenue),
+    rangeRevenue,
+    rangeOrders,
   }
 }
 
-export async function getSalesTrend() {
+export async function getSalesTrend({ from, to } = {}) {
+  const hasRange = Boolean(from && to)
+
+  // Reports page: when a range is selected, the trend spans exactly that
+  // range instead of the fixed trailing 7 days, clamped to 60 days so a
+  // wide custom range still renders as a readable chart rather than
+  // hundreds of slivers in a ~130px-tall bar chart.
   const { rows } = await pool.query(
-    `SELECT to_char(d, 'Dy') AS day, COALESCE(SUM(s.total), 0) AS sales
-     FROM generate_series(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, INTERVAL '1 day') d
-     LEFT JOIN sales s ON s.created_at::date = d::date
-     GROUP BY d
-     ORDER BY d ASC`
+    hasRange
+      ? `SELECT to_char(d, 'DD Mon') AS day, COALESCE(SUM(s.total), 0) AS sales
+         FROM generate_series(
+                ($1::timestamptz AT TIME ZONE '${SHOP_TZ}')::date,
+                LEAST(($2::timestamptz AT TIME ZONE '${SHOP_TZ}')::date,
+                      ($1::timestamptz AT TIME ZONE '${SHOP_TZ}')::date + 60),
+                INTERVAL '1 day'
+              ) d
+         LEFT JOIN sales s ON (s.created_at AT TIME ZONE '${SHOP_TZ}')::date = d::date
+         GROUP BY d
+         ORDER BY d ASC`
+      : `SELECT to_char(d, 'Dy') AS day, COALESCE(SUM(s.total), 0) AS sales
+         FROM generate_series(
+                (now() AT TIME ZONE '${SHOP_TZ}')::date - INTERVAL '6 days',
+                (now() AT TIME ZONE '${SHOP_TZ}')::date,
+                INTERVAL '1 day'
+              ) d
+         LEFT JOIN sales s ON (s.created_at AT TIME ZONE '${SHOP_TZ}')::date = d::date
+         GROUP BY d
+         ORDER BY d ASC`,
+    hasRange ? [from, to] : []
   )
   return rows.map((r) => ({ day: r.day.trim(), sales: Number(r.sales) }))
 }
 
-export async function getBestSellers(limit = 4) {
+export async function getBestSellers({ limit = 4, from, to } = {}) {
+  const conditions = []
+  const params = []
+  if (from) {
+    params.push(from)
+    conditions.push(`s.created_at >= $${params.length}`)
+  }
+  if (to) {
+    params.push(to)
+    conditions.push(`s.created_at <= $${params.length}`)
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+  params.push(limit)
+
   const { rows } = await pool.query(
-    `SELECT product_name AS name, SUM(quantity)::int AS units, SUM(line_total) AS revenue
-     FROM sale_items
-     GROUP BY product_name
+    `SELECT si.product_name AS name, SUM(si.quantity)::int AS units, SUM(si.line_total) AS revenue
+     FROM sale_items si
+     JOIN sales s ON s.id = si.sale_id
+     ${where}
+     GROUP BY si.product_name
      ORDER BY units DESC
-     LIMIT $1`,
-    [limit]
+     LIMIT $${params.length}`,
+    params
   )
   return rows.map((r) => ({ ...r, revenue: Number(r.revenue) }))
 }

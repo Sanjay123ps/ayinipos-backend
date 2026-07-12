@@ -7,7 +7,7 @@ export const adjustStock = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'delta must be a non-zero number' })
   }
   const stock = await applyStockDelta(req.params.id, delta, reason || 'Manual adjustment')
-  res.json({ id: req.params.id, stock })
+  res.json({ id: Number(req.params.id), stock })
 })
 
 export const stockHistory = asyncHandler(async (req, res) => {

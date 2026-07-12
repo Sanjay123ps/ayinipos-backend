@@ -29,6 +29,17 @@ export const removeBill = asyncHandler(async (req, res) => {
   res.json(await Sales.deleteBill(req.params.billNo))
 })
 
+// POST /bills/bulk-delete  { billNumbers: ['BILL-1001', ...] }  — History multi-select
+export const removeBills = asyncHandler(async (req, res) => {
+  const { billNumbers } = req.body
+  if (!Array.isArray(billNumbers) || billNumbers.length === 0) {
+    const err = new Error('billNumbers must be a non-empty array')
+    err.status = 400
+    throw err
+  }
+  res.json(await Sales.bulkDeleteBills(billNumbers))
+})
+
 // GET /bills/export?from=&to=&q=  — History screen "Export"
 export const exportBills = asyncHandler(async (req, res) => {
   const { from, to, q } = req.query

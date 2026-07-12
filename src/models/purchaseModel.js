@@ -2,18 +2,38 @@ import { pool, withTransaction } from '../config/db.js'
 import { findOrCreateSupplier } from './supplierModel.js'
 import { applyStockDelta } from './stockModel.js'
 
-export async function getAllPurchases({ page = 1, limit = 50 } = {}) {
+export async function getAllPurchases({ page = 1, limit = 50, from, to } = {}) {
   const offset = (Math.max(page, 1) - 1) * limit
+  const conditions = []
+  const params = []
+
+  // from/to arrive as full ISO instants (see utils/dateRanges.js on the
+  // frontend). purchase_date is a plain DATE with no time/timezone
+  // component, so each bound is converted to its IST wall-clock date
+  // before comparing — casting straight to ::date here would go through
+  // Postgres's session timezone (UTC on Railway) instead.
+  if (from) {
+    params.push(from)
+    conditions.push(`p.purchase_date >= ($${params.length}::timestamptz AT TIME ZONE 'Asia/Kolkata')::date`)
+  }
+  if (to) {
+    params.push(to)
+    conditions.push(`p.purchase_date <= ($${params.length}::timestamptz AT TIME ZONE 'Asia/Kolkata')::date`)
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+
+  params.push(limit, offset)
   const { rows } = await pool.query(
     `SELECT p.bill_no AS id, p.supplier_name AS supplier, p.invoice_no AS "invoiceNo",
             p.purchase_date AS date, COALESCE(SUM(pi.quantity), 0) AS "totalQuantity",
             COUNT(pi.id)::int AS items
      FROM purchases p
      LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+     ${where}
      GROUP BY p.id
      ORDER BY p.created_at DESC
-     LIMIT $1 OFFSET $2`,
-    [limit, offset]
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
   )
   return rows.map((r) => ({
     ...r,

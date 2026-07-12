@@ -4,8 +4,15 @@ import { getAllSuppliers } from '../models/supplierModel.js'
 import { sendCsv } from '../utils/csvExport.js'
 
 export const listPurchases = asyncHandler(async (req, res) => {
-  const { page, limit } = req.query
-  res.json(await Purchases.getAllPurchases({ page: page ? Number(page) : 1, limit: limit ? Number(limit) : 50 }))
+  const { page, limit, from, to } = req.query
+  res.json(
+    await Purchases.getAllPurchases({
+      page: page ? Number(page) : 1,
+      limit: limit ? Number(limit) : 50,
+      from,
+      to,
+    })
+  )
 })
 
 export const listSuppliers = asyncHandler(async (req, res) => {

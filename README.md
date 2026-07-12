@@ -53,13 +53,13 @@ requires `Authorization: Bearer <token>`.
 | DELETE | `/api/products/:id`           | |
 | PATCH  | `/api/products/:id/stock`     | `{ delta, reason }` — manual stock adjustment |
 | GET    | `/api/products/:id/stock-history` | last 50 stock movements for that product |
-| GET    | `/api/purchases`               | purchase history |
+| GET    | `/api/purchases?from=&to=`     | purchase history, optionally scoped to a date range |
 | GET    | `/api/purchases/suppliers`     | |
 | POST   | `/api/purchases`               | records a purchase **and** bumps product stock, in one transaction |
 | POST   | `/api/bills`                   | creates a sale, decrements stock, in one transaction |
-| GET    | `/api/dashboard/summary`       | today/monthly sales, orders, products, revenue, profit |
-| GET    | `/api/dashboard/sales-trend`   | last 7 days |
-| GET    | `/api/dashboard/best-sellers`  | |
+| GET    | `/api/dashboard/summary?from=&to=` | today/monthly sales (always calendar-fixed), orders/products/revenue (all-time), plus rangeRevenue/rangeOrders scoped to from/to when given |
+| GET    | `/api/dashboard/sales-trend?from=&to=` | daily series; defaults to the last 7 days, or spans from/to when given (capped at 60 days) |
+| GET    | `/api/dashboard/best-sellers?from=&to=` | optionally scoped to a date range |
 | GET    | `/api/dashboard/recent-sales`  | |
 | GET    | `/api/sessions`                | till history |
 | POST   | `/api/sessions`                | closes a till session (denomination count → total/difference computed server-side) |
@@ -72,10 +72,17 @@ requires `Authorization: Bearer <token>`.
   correction writes a row to `stock_adjustments` *and* updates the
   denormalized `products.stock` count, inside the same DB transaction. That
   table doubles as the "Stock History" the spec calls for under Inventory.
-- **Profit uses a real cost snapshot.** `sale_items.cost_price` captures each
-  product's purchase price *at the moment of sale*, so profit reporting stays
-  accurate even after purchase prices change later — it's not just
-  `current price − current purchase price`.
+- **Profit/cost tracking is not implemented in this version.** `products`
+  has a `purchase_price` column and `sale_items` has a `cost_price` column,
+  but neither the product form nor the purchase-entry flow collects a
+  purchase price (see the comments in `productModel.js` and
+  `purchaseModel.js`) — that was a deliberate scope cut, not an oversight.
+  Both columns exist purely so a future version can add real cost tracking
+  without a schema migration, but today they're always `0`. No endpoint
+  returns a `profit` field. If cost tracking gets built later, wire
+  `products.purchase_price` into `createSale`'s product lookup (right next
+  to where price/gst are already read) and it'll flow through everywhere
+  else with a real, per-sale-accurate cost snapshot.
 - **Bill/purchase/session numbers** (`BILL-3001`, `PUR-1001`, `SES-201`) are
   generated from the row's serial id after insert, so they're guaranteed
   unique without a separate counter table.
@@ -91,7 +98,9 @@ Matches the GitHub → Railway pattern used for EggMart POS:
    `CORS_ORIGIN` → your Vercel frontend URL, `SEED_ADMIN_USERNAME`/`PASSWORD`
    if you want non-default seed credentials).
 4. After the first deploy, run migrate + seed once via Railway's shell
-   (`railway run npm run db:migrate && railway run npm run db:seed`).
+   (`railway run npm run db:migrate && railway run npm run db:seed`), then
+   `railway run npm run db:import-products` once to load the real 63-item
+   Ayini catalog (safe to re-run — it skips products that already exist).
 5. Point the frontend's `VITE_API_URL` at the Railway-issued domain.
 
 `railway.json` in this repo already sets the Nixpacks build + start command.

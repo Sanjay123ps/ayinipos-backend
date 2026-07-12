@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { asyncHandler } from '../utils/asyncHandler.js'
 import { findUserByUsername, findUserById, updateUserPassword } from '../models/userModel.js'
+import { getJwtSecret } from '../config/jwt.js'
 
 export const login = asyncHandler(async (req, res) => {
   const { username, password } = req.body
@@ -21,7 +22,7 @@ export const login = asyncHandler(async (req, res) => {
 
   const token = jwt.sign(
     { sub: user.id, username: user.username, role: user.role },
-    process.env.JWT_SECRET || 'dev-secret-change-me',
+    getJwtSecret(),
     { expiresIn: '12h' }
   )
 
