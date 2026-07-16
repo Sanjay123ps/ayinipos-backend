@@ -43,7 +43,7 @@ export async function createSale({ items, discountPercent, customerMobile, custo
       }
 
       const { rows: productRows } = await client.query(
-        'SELECT id, name, price, gst, stock FROM products WHERE id = $1 FOR UPDATE',
+        'SELECT id, name, price, gst, stock, track_stock FROM products WHERE id = $1 FOR UPDATE',
         [item.id]
       )
       const product = productRows[0]
@@ -65,6 +65,7 @@ export async function createSale({ items, discountPercent, customerMobile, custo
         price,
         gst,
         qty,
+        trackStock: product.track_stock,
         lineTotal: lineSubtotal + lineGst,
       })
     }
@@ -95,7 +96,9 @@ export async function createSale({ items, discountPercent, customerMobile, custo
          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
         [saleId, line.id, line.name, line.price, line.gst, line.qty, line.lineTotal]
       )
-      await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
+      if (line.trackStock) {
+        await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
+      }
     }
 
     return {
@@ -235,7 +238,9 @@ export async function bulkDeleteBills(billNumbers) {
       const saleId = rows[0].id
 
       const { rows: items } = await client.query(
-        'SELECT product_id, quantity FROM sale_items WHERE sale_id = $1 AND product_id IS NOT NULL',
+        `SELECT si.product_id, si.quantity FROM sale_items si
+         JOIN products p ON p.id = si.product_id
+         WHERE si.sale_id = $1 AND si.product_id IS NOT NULL AND p.track_stock`,
         [saleId]
       )
       for (const item of items) {
@@ -261,7 +266,9 @@ export async function deleteBill(billNo) {
     const saleId = rows[0].id
 
     const { rows: items } = await client.query(
-      'SELECT product_id, quantity FROM sale_items WHERE sale_id = $1 AND product_id IS NOT NULL',
+      `SELECT si.product_id, si.quantity FROM sale_items si
+       JOIN products p ON p.id = si.product_id
+       WHERE si.sale_id = $1 AND si.product_id IS NOT NULL AND p.track_stock`,
       [saleId]
     )
     for (const item of items) {

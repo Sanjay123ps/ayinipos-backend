@@ -18,6 +18,8 @@ function toApiShape(row) {
     lowStockLimit: row.low_stock_limit,
     emoji: row.emoji,
     image: row.image,
+    unit: row.unit,
+    trackStock: row.track_stock,
   }
 }
 
@@ -39,12 +41,24 @@ export async function getCategories() {
 export async function createProduct(payload) {
   // purchasePrice is no longer collected from clients; the column keeps its
   // DB default (0) for any newly created product.
-  const { name, category, barcode, price, gst, stock, lowStockLimit, emoji, image } = payload
+  const { name, category, barcode, price, gst, stock, lowStockLimit, emoji, image, unit, trackStock } = payload
   const { rows } = await pool.query(
-    `INSERT INTO products (name, category, barcode, price, gst, stock, low_stock_limit, emoji, image)
-     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9)
+    `INSERT INTO products (name, category, barcode, price, gst, stock, low_stock_limit, emoji, image, unit, track_stock)
+     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9, COALESCE($10, 'pcs'), COALESCE($11, true))
      RETURNING *`,
-    [name, category, barcode || null, price || 0, gst || 0, stock || 0, lowStockLimit || 10, emoji, image || null]
+    [
+      name,
+      category,
+      barcode || null,
+      price || 0,
+      gst || 0,
+      stock || 0,
+      lowStockLimit || 10,
+      emoji,
+      image || null,
+      unit || 'pcs',
+      trackStock === undefined ? true : trackStock,
+    ]
   )
   return toApiShape(rows[0])
 }
@@ -61,8 +75,8 @@ export async function updateProduct(id, payload) {
       `UPDATE products
        SET name = $1, category = $2, barcode = $3, price = $4,
            gst = $5, low_stock_limit = $6, emoji = COALESCE($7, emoji),
-           image = $8, updated_at = now()
-       WHERE id = $9
+           image = $8, unit = $9, track_stock = $10, updated_at = now()
+       WHERE id = $11
        RETURNING *`,
       [
         merged.name,
@@ -73,6 +87,8 @@ export async function updateProduct(id, payload) {
         merged.lowStockLimit,
         merged.emoji,
         merged.image,
+        merged.unit || 'pcs',
+        merged.trackStock === undefined ? true : merged.trackStock,
         id,
       ]
     )
@@ -87,7 +103,7 @@ export async function updateProduct(id, payload) {
     // purchases, and the Inventory tab's +/- stepper all already go
     // through that same ledger, and this keeps it that way.
     const requestedStock = payload.stock
-    if (requestedStock !== undefined && requestedStock !== null) {
+    if (updated.trackStock && requestedStock !== undefined && requestedStock !== null) {
       const newStock = Number(requestedStock)
       if (Number.isFinite(newStock) && newStock >= 0 && Math.round(newStock) !== existing.stock) {
         const delta = Math.round(newStock) - existing.stock

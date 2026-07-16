@@ -142,9 +142,13 @@ CREATE TABLE IF NOT EXISTS sale_items (
   price        NUMERIC(10, 2) NOT NULL,
   cost_price   NUMERIC(10, 2) NOT NULL DEFAULT 0,
   gst          NUMERIC(5, 2) NOT NULL DEFAULT 0,
-  quantity     INTEGER NOT NULL,
+  quantity     NUMERIC(10, 3) NOT NULL,
   line_total   NUMERIC(10, 2) NOT NULL
 );
+
+-- Idempotent upgrade path: quantity used to be INTEGER, which can't hold a
+-- weight like 0.75 kg for weight-priced products (see products.unit below).
+ALTER TABLE sale_items ALTER COLUMN quantity TYPE NUMERIC(10, 3);
 
 -- Append-only ledger for every stock movement (sale, purchase, manual
 -- correction). products.stock is a denormalized running total kept in sync
@@ -153,10 +157,12 @@ CREATE TABLE IF NOT EXISTS sale_items (
 CREATE TABLE IF NOT EXISTS stock_adjustments (
   id         SERIAL PRIMARY KEY,
   product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-  delta      INTEGER NOT NULL,
+  delta      NUMERIC(10, 3) NOT NULL,
   reason     TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE stock_adjustments ALTER COLUMN delta TYPE NUMERIC(10, 3);
 
 CREATE INDEX IF NOT EXISTS idx_stock_adjustments_product ON stock_adjustments(product_id);
 
@@ -215,3 +221,12 @@ ALTER TABLE purchase_items ALTER COLUMN product_id DROP NOT NULL;
 ALTER TABLE purchase_items DROP CONSTRAINT IF EXISTS purchase_items_product_id_fkey;
 ALTER TABLE purchase_items ADD CONSTRAINT purchase_items_product_id_fkey
   FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL;
+
+-- `unit` distinguishes ordinary piece-counted products ('pcs') from
+-- weight-priced ones ('kg') like "Idly maavu grinding" (₹10/kg) — the
+-- Billing screen shows a weight input instead of a +/- qty stepper for
+-- 'kg' products. `track_stock` lets a product opt out of stock tracking
+-- entirely (a grinding service has no fixed inventory), so it never shows
+-- "out of stock" and sales never touch its stock count.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'pcs';
+ALTER TABLE products ADD COLUMN IF NOT EXISTS track_stock BOOLEAN NOT NULL DEFAULT true;

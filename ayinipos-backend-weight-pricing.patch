@@ -1,0 +1,170 @@
+diff -ru orig/ayinipos-backend-main/src/db/schema.sql ayinipos-backend-main/src/db/schema.sql
+--- orig/ayinipos-backend-main/src/db/schema.sql	2026-07-14 11:24:25.000000000 +0000
++++ ayinipos-backend-main/src/db/schema.sql	2026-07-16 08:57:33.356274481 +0000
+@@ -142,10 +142,14 @@
+   price        NUMERIC(10, 2) NOT NULL,
+   cost_price   NUMERIC(10, 2) NOT NULL DEFAULT 0,
+   gst          NUMERIC(5, 2) NOT NULL DEFAULT 0,
+-  quantity     INTEGER NOT NULL,
++  quantity     NUMERIC(10, 3) NOT NULL,
+   line_total   NUMERIC(10, 2) NOT NULL
+ );
+ 
++-- Idempotent upgrade path: quantity used to be INTEGER, which can't hold a
++-- weight like 0.75 kg for weight-priced products (see products.unit below).
++ALTER TABLE sale_items ALTER COLUMN quantity TYPE NUMERIC(10, 3);
++
+ -- Append-only ledger for every stock movement (sale, purchase, manual
+ -- correction). products.stock is a denormalized running total kept in sync
+ -- with this table inside the same transaction, so this also doubles as the
+@@ -153,11 +157,13 @@
+ CREATE TABLE IF NOT EXISTS stock_adjustments (
+   id         SERIAL PRIMARY KEY,
+   product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+-  delta      INTEGER NOT NULL,
++  delta      NUMERIC(10, 3) NOT NULL,
+   reason     TEXT NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+ );
+ 
++ALTER TABLE stock_adjustments ALTER COLUMN delta TYPE NUMERIC(10, 3);
++
+ CREATE INDEX IF NOT EXISTS idx_stock_adjustments_product ON stock_adjustments(product_id);
+ 
+ CREATE TABLE IF NOT EXISTS sessions (
+@@ -215,3 +221,12 @@
+ ALTER TABLE purchase_items DROP CONSTRAINT IF EXISTS purchase_items_product_id_fkey;
+ ALTER TABLE purchase_items ADD CONSTRAINT purchase_items_product_id_fkey
+   FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL;
++
++-- `unit` distinguishes ordinary piece-counted products ('pcs') from
++-- weight-priced ones ('kg') like "Idly maavu grinding" (₹10/kg) — the
++-- Billing screen shows a weight input instead of a +/- qty stepper for
++-- 'kg' products. `track_stock` lets a product opt out of stock tracking
++-- entirely (a grinding service has no fixed inventory), so it never shows
++-- "out of stock" and sales never touch its stock count.
++ALTER TABLE products ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'pcs';
++ALTER TABLE products ADD COLUMN IF NOT EXISTS track_stock BOOLEAN NOT NULL DEFAULT true;
+diff -ru orig/ayinipos-backend-main/src/models/productModel.js ayinipos-backend-main/src/models/productModel.js
+--- orig/ayinipos-backend-main/src/models/productModel.js	2026-07-14 11:24:25.000000000 +0000
++++ ayinipos-backend-main/src/models/productModel.js	2026-07-16 08:57:51.925089869 +0000
+@@ -18,6 +18,8 @@
+     lowStockLimit: row.low_stock_limit,
+     emoji: row.emoji,
+     image: row.image,
++    unit: row.unit,
++    trackStock: row.track_stock,
+   }
+ }
+ 
+@@ -39,12 +41,24 @@
+ export async function createProduct(payload) {
+   // purchasePrice is no longer collected from clients; the column keeps its
+   // DB default (0) for any newly created product.
+-  const { name, category, barcode, price, gst, stock, lowStockLimit, emoji, image } = payload
++  const { name, category, barcode, price, gst, stock, lowStockLimit, emoji, image, unit, trackStock } = payload
+   const { rows } = await pool.query(
+-    `INSERT INTO products (name, category, barcode, price, gst, stock, low_stock_limit, emoji, image)
+-     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9)
++    `INSERT INTO products (name, category, barcode, price, gst, stock, low_stock_limit, emoji, image, unit, track_stock)
++     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9, COALESCE($10, 'pcs'), COALESCE($11, true))
+      RETURNING *`,
+-    [name, category, barcode || null, price || 0, gst || 0, stock || 0, lowStockLimit || 10, emoji, image || null]
++    [
++      name,
++      category,
++      barcode || null,
++      price || 0,
++      gst || 0,
++      stock || 0,
++      lowStockLimit || 10,
++      emoji,
++      image || null,
++      unit || 'pcs',
++      trackStock === undefined ? true : trackStock,
++    ]
+   )
+   return toApiShape(rows[0])
+ }
+@@ -61,8 +75,8 @@
+       `UPDATE products
+        SET name = $1, category = $2, barcode = $3, price = $4,
+            gst = $5, low_stock_limit = $6, emoji = COALESCE($7, emoji),
+-           image = $8, updated_at = now()
+-       WHERE id = $9
++           image = $8, unit = $9, track_stock = $10, updated_at = now()
++       WHERE id = $11
+        RETURNING *`,
+       [
+         merged.name,
+@@ -73,6 +87,8 @@
+         merged.lowStockLimit,
+         merged.emoji,
+         merged.image,
++        merged.unit || 'pcs',
++        merged.trackStock === undefined ? true : merged.trackStock,
+         id,
+       ]
+     )
+@@ -87,7 +103,7 @@
+     // purchases, and the Inventory tab's +/- stepper all already go
+     // through that same ledger, and this keeps it that way.
+     const requestedStock = payload.stock
+-    if (requestedStock !== undefined && requestedStock !== null) {
++    if (updated.trackStock && requestedStock !== undefined && requestedStock !== null) {
+       const newStock = Number(requestedStock)
+       if (Number.isFinite(newStock) && newStock >= 0 && Math.round(newStock) !== existing.stock) {
+         const delta = Math.round(newStock) - existing.stock
+diff -ru orig/ayinipos-backend-main/src/models/saleModel.js ayinipos-backend-main/src/models/saleModel.js
+--- orig/ayinipos-backend-main/src/models/saleModel.js	2026-07-14 11:24:25.000000000 +0000
++++ ayinipos-backend-main/src/models/saleModel.js	2026-07-16 08:58:11.877717806 +0000
+@@ -43,7 +43,7 @@
+       }
+ 
+       const { rows: productRows } = await client.query(
+-        'SELECT id, name, price, gst, stock FROM products WHERE id = $1 FOR UPDATE',
++        'SELECT id, name, price, gst, stock, track_stock FROM products WHERE id = $1 FOR UPDATE',
+         [item.id]
+       )
+       const product = productRows[0]
+@@ -65,6 +65,7 @@
+         price,
+         gst,
+         qty,
++        trackStock: product.track_stock,
+         lineTotal: lineSubtotal + lineGst,
+       })
+     }
+@@ -95,7 +96,9 @@
+          VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+         [saleId, line.id, line.name, line.price, line.gst, line.qty, line.lineTotal]
+       )
+-      await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
++      if (line.trackStock) {
++        await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
++      }
+     }
+ 
+     return {
+@@ -235,7 +238,9 @@
+       const saleId = rows[0].id
+ 
+       const { rows: items } = await client.query(
+-        'SELECT product_id, quantity FROM sale_items WHERE sale_id = $1 AND product_id IS NOT NULL',
++        `SELECT si.product_id, si.quantity FROM sale_items si
++         JOIN products p ON p.id = si.product_id
++         WHERE si.sale_id = $1 AND si.product_id IS NOT NULL AND p.track_stock`,
+         [saleId]
+       )
+       for (const item of items) {
+@@ -261,7 +266,9 @@
+     const saleId = rows[0].id
+ 
+     const { rows: items } = await client.query(
+-      'SELECT product_id, quantity FROM sale_items WHERE sale_id = $1 AND product_id IS NOT NULL',
++      `SELECT si.product_id, si.quantity FROM sale_items si
++       JOIN products p ON p.id = si.product_id
++       WHERE si.sale_id = $1 AND si.product_id IS NOT NULL AND p.track_stock`,
+       [saleId]
+     )
+     for (const item of items) {
