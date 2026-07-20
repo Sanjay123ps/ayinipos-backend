@@ -1,17 +1,13 @@
 import { pool, withTransaction } from '../config/db.js'
 import { findOrCreateSupplier } from './supplierModel.js'
 import { applyStockDelta } from './stockModel.js'
+import { validateBillImage } from '../utils/billImage.js'
 
 export async function getAllPurchases({ page = 1, limit = 50, from, to } = {}) {
   const offset = (Math.max(page, 1) - 1) * limit
   const conditions = []
   const params = []
 
-  // from/to arrive as full ISO instants (see utils/dateRanges.js on the
-  // frontend). purchase_date is a plain DATE with no time/timezone
-  // component, so each bound is converted to its IST wall-clock date
-  // before comparing — casting straight to ::date here would go through
-  // Postgres's session timezone (UTC on Railway) instead.
   if (from) {
     params.push(from)
     conditions.push(`p.purchase_date >= ($${params.length}::timestamptz AT TIME ZONE 'Asia/Kolkata')::date`)
@@ -25,8 +21,10 @@ export async function getAllPurchases({ page = 1, limit = 50, from, to } = {}) {
   params.push(limit, offset)
   const { rows } = await pool.query(
     `SELECT p.bill_no AS id, p.supplier_name AS supplier, p.invoice_no AS "invoiceNo",
-            p.purchase_date AS date, COALESCE(SUM(pi.quantity), 0) AS "totalQuantity",
-            COUNT(pi.id)::int AS items
+            p.purchase_date AS date, p.notes, p.subtotal AS "totalAmount",
+            COALESCE(SUM(pi.quantity), 0) AS "totalQuantity",
+            COUNT(pi.id)::int AS items,
+            (p.bill_image IS NOT NULL) AS "hasBillImage"
      FROM purchases p
      LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
      ${where}
@@ -38,13 +36,15 @@ export async function getAllPurchases({ page = 1, limit = 50, from, to } = {}) {
   return rows.map((r) => ({
     ...r,
     totalQuantity: Number(r.totalQuantity),
+    totalAmount: Number(r.totalAmount),
   }))
 }
 
 export async function getPurchaseByNo(billNo) {
   const { rows: purchaseRows } = await pool.query(
     `SELECT bill_no AS id, supplier_name AS supplier, invoice_no AS "invoiceNo",
-            purchase_date AS date, created_at AS "createdAt"
+            purchase_date AS date, subtotal AS "totalAmount", notes,
+            bill_image AS "billImage", created_at AS "createdAt"
      FROM purchases WHERE bill_no = $1`,
     [billNo]
   )
@@ -56,7 +56,9 @@ export async function getPurchaseByNo(billNo) {
   }
 
   const { rows: items } = await pool.query(
-    `SELECT pi.product_id AS "productId", pi.product_name AS "productName", pi.unit, pi.quantity
+    `SELECT pi.product_id AS "productId", pi.product_name AS "productName", pi.unit,
+            pi.quantity, pi.purchase_price AS "purchasePrice", pi.line_total AS "lineTotal",
+            pi.product_type AS "productType"
      FROM purchase_items pi
      JOIN purchases p ON p.id = pi.purchase_id
      WHERE p.bill_no = $1
@@ -66,70 +68,99 @@ export async function getPurchaseByNo(billNo) {
 
   return {
     ...purchase,
+    totalAmount: Number(purchase.totalAmount),
     items: items.map((i) => ({
       ...i,
       quantity: Number(i.quantity),
+      purchasePrice: Number(i.purchasePrice),
+      lineTotal: Number(i.lineTotal),
     })),
   }
 }
 
-// Builds the line list for a purchase bill. Purchases only ever move
-// stock — there is no pricing/cost data collected or stored on the bill
-// itself (see Purchase Module rules: purchase price is never asked for).
 function buildLines(items) {
   if (!items || items.length === 0) {
     const err = new Error('A purchase bill needs at least one product')
     err.status = 400
     throw err
   }
-  return items.map((item) => ({
-    productId: item.productId,
-    productName: item.productName,
-    unit: item.unit || 'pcs',
-    quantity: Number(item.quantity),
-  }))
+  return items.map((item, idx) => {
+    const productName = (item.productName || '').trim()
+    if (!productName) {
+      const err = new Error(`Line ${idx + 1} needs a product name`)
+      err.status = 400
+      throw err
+    }
+    const quantity = Number(item.quantity)
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      const err = new Error(`Line ${idx + 1} needs a valid quantity`)
+      err.status = 400
+      throw err
+    }
+    const purchasePrice = item.purchasePrice === undefined || item.purchasePrice === null || item.purchasePrice === ''
+      ? 0
+      : Number(item.purchasePrice)
+    if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+      const err = new Error(`Line ${idx + 1} needs a valid purchase price`)
+      err.status = 400
+      throw err
+    }
+    const productId = item.productId || null
+    return {
+      productId,
+      productName,
+      unit: item.unit || 'Nos',
+      quantity,
+      purchasePrice,
+      lineTotal: Number((quantity * purchasePrice).toFixed(2)),
+      productType: productId ? 'catalog' : 'manual',
+    }
+  })
 }
 
-// Support multi-product purchase bills: one supplier/invoice, many product
-// lines, each moving its own stock in the same transaction. Purchases only
-// ever affect stock quantities — no pricing is read or written here.
-export async function createPurchase({ supplier, invoiceNo, date, items }) {
+async function insertLines(client, purchaseId, billNo, lines, reasonSuffix = '') {
+  for (const line of lines) {
+    await client.query(
+      `INSERT INTO purchase_items
+         (purchase_id, product_id, product_name, unit, quantity, purchase_price, selling_price, gst_rate, line_total, amount, product_type)
+       VALUES ($1,$2,$3,$4,$5,$6,0,0,$7,$7,$8)`,
+      [purchaseId, line.productId, line.productName, line.unit, line.quantity, line.purchasePrice, line.lineTotal, line.productType]
+    )
+    if (line.productId) {
+      await applyStockDelta(line.productId, line.quantity, `Purchase ${billNo}${reasonSuffix}`, client)
+    }
+  }
+}
+
+export async function createPurchase({ supplier, invoiceNo, date, items, billImage, notes }) {
   const lines = buildLines(items)
+  const subtotal = Number(lines.reduce((sum, l) => sum + l.lineTotal, 0).toFixed(2))
+  const validatedImage = validateBillImage(billImage)
 
   return withTransaction(async (client) => {
     const supplierId = await findOrCreateSupplier(supplier, client)
 
     const { rows } = await client.query(
-      `INSERT INTO purchases (supplier_id, supplier_name, invoice_no, purchase_date)
-       VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE))
+      `INSERT INTO purchases (supplier_id, supplier_name, invoice_no, purchase_date, subtotal, total_amount, bill_image, notes)
+       VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE), $5, $5, $6, $7)
        RETURNING id`,
-      [supplierId, supplier, invoiceNo || null, date || null]
+      [supplierId, supplier, invoiceNo || null, date || null, subtotal, validatedImage || null, notes || null]
     )
     const purchaseId = rows[0].id
     const billNo = `PUR-${1000 + purchaseId}`
     await client.query('UPDATE purchases SET bill_no = $1 WHERE id = $2', [billNo, purchaseId])
 
-    for (const line of lines) {
-      // purchase_price/selling_price/gst_rate/line_total/amount are legacy
-      // NOT NULL columns on this table; they're written as 0 since
-      // purchases no longer carry any pricing information.
-      await client.query(
-        `INSERT INTO purchase_items (purchase_id, product_id, product_name, unit, quantity, purchase_price, selling_price, gst_rate, line_total, amount)
-         VALUES ($1,$2,$3,$4,$5,0,0,0,0,0)`,
-        [purchaseId, line.productId, line.productName, line.unit, line.quantity]
-      )
-      await applyStockDelta(line.productId, line.quantity, `Purchase ${billNo}`, client)
-    }
+    await insertLines(client, purchaseId, billNo, lines)
 
-    return { id: billNo, supplier, invoiceNo, date, items: lines.length }
+    return { id: billNo, supplier, invoiceNo, date, items: lines.length, totalAmount: subtotal }
   })
 }
 
-// Edits an existing multi-product purchase bill in place: reverses the
-// stock effect of the old line items, then re-applies the new ones, all
-// inside one transaction so inventory never drifts mid-edit.
-export async function updatePurchase(billNo, { supplier, invoiceNo, date, items }) {
+export async function updatePurchase(billNo, { supplier, invoiceNo, date, items, billImage, notes }) {
   const lines = buildLines(items)
+  const subtotal = Number(lines.reduce((sum, l) => sum + l.lineTotal, 0).toFixed(2))
+  const imageProvided = billImage !== undefined
+  const validatedImage = imageProvided ? validateBillImage(billImage) : undefined
 
   return withTransaction(async (client) => {
     const { rows } = await client.query('SELECT id FROM purchases WHERE bill_no = $1', [billNo])
@@ -145,33 +176,29 @@ export async function updatePurchase(billNo, { supplier, invoiceNo, date, items 
       [purchaseId]
     )
     for (const item of oldItems) {
-      await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} edited`, client)
+      if (item.product_id) {
+        await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} edited`, client)
+      }
     }
     await client.query('DELETE FROM purchase_items WHERE purchase_id = $1', [purchaseId])
 
     const supplierId = await findOrCreateSupplier(supplier, client)
     await client.query(
       `UPDATE purchases
-       SET supplier_id = $1, supplier_name = $2, invoice_no = $3, purchase_date = COALESCE($4, purchase_date)
-       WHERE id = $5`,
-      [supplierId, supplier, invoiceNo || null, date || null, purchaseId]
+       SET supplier_id = $1, supplier_name = $2, invoice_no = $3, purchase_date = COALESCE($4, purchase_date),
+           subtotal = $5, total_amount = $5,
+           bill_image = CASE WHEN $6 THEN $7 ELSE bill_image END,
+           notes = COALESCE($8, notes)
+       WHERE id = $9`,
+      [supplierId, supplier, invoiceNo || null, date || null, subtotal, imageProvided, validatedImage || null, notes, purchaseId]
     )
 
-    for (const line of lines) {
-      await client.query(
-        `INSERT INTO purchase_items (purchase_id, product_id, product_name, unit, quantity, purchase_price, selling_price, gst_rate, line_total, amount)
-         VALUES ($1,$2,$3,$4,$5,0,0,0,0,0)`,
-        [purchaseId, line.productId, line.productName, line.unit, line.quantity]
-      )
-      await applyStockDelta(line.productId, line.quantity, `Purchase ${billNo} edited`, client)
-    }
+    await insertLines(client, purchaseId, billNo, lines, ' edited')
 
-    return { id: billNo, supplier, invoiceNo, date, items: lines.length }
+    return { id: billNo, supplier, invoiceNo, date, items: lines.length, totalAmount: subtotal }
   })
 }
 
-// Deletes a purchase bill and reverses the stock it had added, keeping the
-// stock ledger accurate (mirrors saleModel.deleteBill).
 export async function deletePurchase(billNo) {
   return withTransaction(async (client) => {
     const { rows } = await client.query('SELECT id FROM purchases WHERE bill_no = $1', [billNo])
@@ -187,10 +214,46 @@ export async function deletePurchase(billNo) {
       [purchaseId]
     )
     for (const item of items) {
-      await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} deleted`, client)
+      if (item.product_id) {
+        await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} deleted`, client)
+      }
     }
 
     await client.query('DELETE FROM purchases WHERE id = $1', [purchaseId])
     return { id: billNo, deleted: true }
   })
+}
+
+export async function getPurchaseExportRows({ from, to } = {}) {
+  const conditions = []
+  const params = []
+  if (from) {
+    params.push(from)
+    conditions.push(`p.purchase_date >= ($${params.length}::timestamptz AT TIME ZONE 'Asia/Kolkata')::date`)
+  }
+  if (to) {
+    params.push(to)
+    conditions.push(`p.purchase_date <= ($${params.length}::timestamptz AT TIME ZONE 'Asia/Kolkata')::date`)
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+
+  const { rows } = await pool.query(
+    `SELECT p.bill_no AS "billNo", p.purchase_date AS "purchaseDate", p.supplier_name AS "supplierName",
+            pi.product_name AS "productName", pi.product_type AS "productType",
+            pi.quantity, pi.unit, pi.purchase_price AS "purchasePrice", pi.line_total AS "lineTotal",
+            p.subtotal AS "billTotal", p.notes
+     FROM purchase_items pi
+     JOIN purchases p ON p.id = pi.purchase_id
+     ${where}
+     ORDER BY p.created_at DESC, pi.id ASC`,
+    params
+  )
+  return rows.map((r) => ({
+    ...r,
+    productType: r.productType === 'manual' ? 'Manual' : 'Catalog',
+    quantity: Number(r.quantity),
+    purchasePrice: Number(r.purchasePrice),
+    lineTotal: Number(r.lineTotal),
+    billTotal: Number(r.billTotal),
+  }))
 }
