@@ -35,16 +35,22 @@ export const removePurchase = asyncHandler(async (req, res) => {
   res.json(await Purchases.deletePurchase(req.params.billNo))
 })
 
-// GET /purchases/export
+// GET /purchases/export — one row per purchased product (catalog or
+// manual), deliberately excluding the uploaded bill image.
 export const exportPurchases = asyncHandler(async (req, res) => {
-  const { limit } = req.query
-  const rows = await Purchases.getAllPurchases({ page: 1, limit: limit ? Number(limit) : 100000 })
+  const { from, to } = req.query
+  const rows = await Purchases.getPurchaseExportRows({ from, to })
   sendCsv(res, `purchases-${Date.now()}.csv`, rows, [
-    { key: 'id', label: 'Purchase No' },
-    { key: 'date', label: 'Date' },
-    { key: 'supplier', label: 'Supplier' },
-    { key: 'invoiceNo', label: 'Invoice No' },
-    { key: 'items', label: 'Product Lines' },
-    { key: 'totalQuantity', label: 'Total Quantity' },
+    { key: 'billNo', label: 'Purchase Bill Number' },
+    { key: 'purchaseDate', label: 'Purchase Date' },
+    { key: 'supplierName', label: 'Supplier Name' },
+    { key: 'productName', label: 'Product Name' },
+    { key: 'productType', label: 'Product Type' },
+    { key: 'quantity', label: 'Quantity' },
+    { key: 'unit', label: 'Unit' },
+    { key: 'purchasePrice', label: 'Purchase Price' },
+    { key: 'lineTotal', label: 'Line Total' },
+    { key: 'billTotal', label: 'Overall Bill Total' },
+    { key: 'notes', label: 'Notes' },
   ])
 })
