@@ -230,3 +230,30 @@ ALTER TABLE purchase_items ADD CONSTRAINT purchase_items_product_id_fkey
 -- "out of stock" and sales never touch its stock count.
 ALTER TABLE products ADD COLUMN IF NOT EXISTS unit TEXT NOT NULL DEFAULT 'pcs';
 ALTER TABLE products ADD COLUMN IF NOT EXISTS track_stock BOOLEAN NOT NULL DEFAULT true;
+
+-- Purchase Page Enhancement:
+-- * `bill_image` holds the supplier's photographed bill as a base64 data
+--   URL (same storage pattern as products.image above) — record-keeping
+--   only, deliberately never read by CSV export or any calculation.
+-- * `notes` is a free-text field surfaced in Purchase History and export.
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS bill_image TEXT;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS notes TEXT;
+
+-- `product_type` distinguishes catalog products (linked via product_id)
+-- from manual/non-catalog purchase lines (packing material, transport
+-- charges, etc.) that exist only inside this one purchase bill and must
+-- never spawn a row in `products`. purchase_price/line_total already
+-- existed as legacy columns (previously always written as 0); they are now
+-- populated with real, manually-entered values.
+ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS product_type TEXT NOT NULL DEFAULT 'catalog';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'purchase_items_product_type_check'
+  ) THEN
+    ALTER TABLE purchase_items ADD CONSTRAINT purchase_items_product_type_check
+      CHECK (product_type IN ('catalog', 'manual'));
+  END IF;
+END $$;
+-- Backfill: any existing row with no linked product must be manual.
+UPDATE purchase_items SET product_type = 'manual' WHERE product_id IS NULL AND product_type = 'catalog';
