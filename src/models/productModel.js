@@ -42,9 +42,19 @@ export async function createProduct(payload) {
   // purchasePrice is no longer collected from clients; the column keeps its
   // DB default (0) for any newly created product.
   const { name, category, barcode, price, gst, stock, lowStockLimit, emoji, image, unit, trackStock } = payload
+  const resolvedUnit = unit || 'pcs'
+  // Weight-priced ('kg') products never track stock (see schema.sql) — the
+  // product form already enforces this on every save, but that only covers
+  // requests that go through the form. Anything that bypasses it (the
+  // db:import-products script, a direct API call, a future admin tool) can
+  // still insert a 'kg' product with track_stock left at its default of
+  // true, which then crashes stock updates: products.stock is INTEGER, and
+  // a fractional kg quantity like "1.000" fails to cast to it. Enforcing
+  // the rule here too closes that gap regardless of the caller.
+  const resolvedTrackStock = resolvedUnit === 'kg' ? false : (trackStock === undefined ? true : trackStock)
   const { rows } = await pool.query(
     `INSERT INTO products (name, category, barcode, price, gst, stock, low_stock_limit, emoji, image, unit, track_stock)
-     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9, COALESCE($10, 'pcs'), COALESCE($11, true))
+     VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, '🛒'), $9, $10, $11)
      RETURNING *`,
     [
       name,
@@ -56,8 +66,8 @@ export async function createProduct(payload) {
       lowStockLimit || 10,
       emoji,
       image || null,
-      unit || 'pcs',
-      trackStock === undefined ? true : trackStock,
+      resolvedUnit,
+      resolvedTrackStock,
     ]
   )
   return toApiShape(rows[0])
@@ -68,6 +78,9 @@ export async function updateProduct(id, payload) {
     const existing = await getProductById(id, client)
     if (!existing) return null
     const merged = { ...existing, ...payload }
+    const resolvedUnit = merged.unit || 'pcs'
+    // Same enforcement as createProduct above — see comment there.
+    const resolvedTrackStock = resolvedUnit === 'kg' ? false : (merged.trackStock === undefined ? true : merged.trackStock)
 
     // purchase_price is deliberately left out of this UPDATE so existing
     // values are preserved untouched — it is not part of the edit form anymore.
@@ -87,8 +100,8 @@ export async function updateProduct(id, payload) {
         merged.lowStockLimit,
         merged.emoji,
         merged.image,
-        merged.unit || 'pcs',
-        merged.trackStock === undefined ? true : merged.trackStock,
+        resolvedUnit,
+        resolvedTrackStock,
         id,
       ]
     )
