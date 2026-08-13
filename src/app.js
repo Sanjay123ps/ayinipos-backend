@@ -5,6 +5,12 @@ import { notFound, errorHandler } from './middleware/errorHandler.js'
 
 const app = express()
 
+// Render sits as a single reverse proxy in front of this app, so trust
+// exactly one hop — this lets express-rate-limit read the real client IP
+// from X-Forwarded-For instead of the proxy's IP, without trusting the
+// whole header chain (which a client could otherwise spoof).
+app.set('trust proxy', 1)
+
 const corsOrigin = process.env.CORS_ORIGIN
 app.use(
   cors({
