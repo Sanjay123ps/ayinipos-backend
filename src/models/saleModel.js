@@ -55,8 +55,28 @@ export async function createSale({ items, discountPercent, customerMobile, custo
 
       const price = Number(product.price)
       const gst = Number(product.gst)
-      const lineSubtotal = price * qty
-      const lineGst = (lineSubtotal * gst) / 100
+      const calculatedSubtotal = round2(price * qty)
+
+      // Cart Final Price Editor: the cashier can override this line's
+      // calculated subtotal from the Billing screen (e.g. ₹80 → ₹78). Same
+      // trust boundary as price/gst above — the override is only ever
+      // applied after being validated as a finite, non-negative number;
+      // anything missing, blank, or malformed just falls back to the
+      // normal price × qty calculation, so a manipulated/garbage request
+      // body can't produce an inconsistent or negative bill.
+      let finalPrice = null
+      if (item.finalPrice !== undefined && item.finalPrice !== null && item.finalPrice !== '') {
+        const parsed = Number(item.finalPrice)
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          const err = new Error(`Invalid final price for product ${item.id}`)
+          err.status = 400
+          throw err
+        }
+        finalPrice = round2(parsed)
+      }
+
+      const lineSubtotal = finalPrice !== null ? finalPrice : calculatedSubtotal
+      const lineGst = round2((lineSubtotal * gst) / 100)
       subtotal += lineSubtotal
       gstAmount += lineGst
       lines.push({
@@ -66,7 +86,15 @@ export async function createSale({ items, discountPercent, customerMobile, custo
         gst,
         qty,
         trackStock: product.track_stock,
-        lineTotal: lineSubtotal + lineGst,
+        // Pre-GST amount actually billed for this line (the override when
+        // present, otherwise price × qty) — used by the receipt so it never
+        // reverts to showing the un-edited price × qty figure.
+        lineSubtotal,
+        // Non-null only when the cashier manually edited this line; kept
+        // distinct from lineSubtotal so callers can tell an override
+        // happened without comparing against price × qty themselves.
+        finalPrice,
+        lineTotal: round2(lineSubtotal + lineGst),
       })
     }
 
@@ -84,7 +112,18 @@ export async function createSale({ items, discountPercent, customerMobile, custo
       `INSERT INTO sales (customer_id, customer_mobile, customer_name, discount_percent, subtotal, gst_amount, discount_amount, total, payment_mode, credit_status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        RETURNING id, created_at`,
-      [customerId, customerMobile || null, customerName || null, discountPercent || 0, subtotal, gstAmount, discountAmount, total, mode, creditStatus]
+      [
+        customerId,
+        customerMobile || null,
+        customerName || null,
+        discountPercent || 0,
+        round2(subtotal),
+        round2(gstAmount),
+        round2(discountAmount),
+        round2(total),
+        mode,
+        creditStatus,
+      ]
     )
     const saleId = rows[0].id
     const billNo = `BILL-${3000 + saleId}`
@@ -92,9 +131,9 @@ export async function createSale({ items, discountPercent, customerMobile, custo
 
     for (const line of lines) {
       await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, product_name, price, gst, quantity, line_total)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-        [saleId, line.id, line.name, line.price, line.gst, line.qty, line.lineTotal]
+        `INSERT INTO sale_items (sale_id, product_id, product_name, price, gst, quantity, line_total, final_price)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [saleId, line.id, line.name, line.price, line.gst, line.qty, line.lineTotal, line.finalPrice]
       )
       if (line.trackStock) {
         await applyStockDelta(line.id, -line.qty, `Sale ${billNo}`, client)
@@ -197,7 +236,7 @@ export async function getBillByNo(billNo) {
   }
 
   const { rows: items } = await pool.query(
-    `SELECT product_name AS name, price, gst, quantity AS qty, line_total AS "lineTotal"
+    `SELECT product_name AS name, price, gst, quantity AS qty, line_total AS "lineTotal", final_price AS "finalPrice"
      FROM sale_items si
      JOIN sales s ON s.id = si.sale_id
      WHERE s.bill_no = $1
@@ -211,7 +250,13 @@ export async function getBillByNo(billNo) {
     gstAmount: Number(sale.gst_amount),
     discountAmount: Number(sale.discount_amount),
     total: Number(sale.total),
-    items: items.map((i) => ({ ...i, price: Number(i.price), gst: Number(i.gst), lineTotal: Number(i.lineTotal) })),
+    items: items.map((i) => ({
+      ...i,
+      price: Number(i.price),
+      gst: Number(i.gst),
+      lineTotal: Number(i.lineTotal),
+      finalPrice: i.finalPrice === null ? null : Number(i.finalPrice),
+    })),
   }
 }
 
