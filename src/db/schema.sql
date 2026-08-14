@@ -257,3 +257,13 @@ BEGIN
 END $$;
 -- Backfill: any existing row with no linked product must be manual.
 UPDATE purchase_items SET product_type = 'manual' WHERE product_id IS NULL AND product_type = 'catalog';
+
+-- Cart Final Price Editor: lets the cashier override a cart line's
+-- calculated subtotal (unit price × qty) with a manually typed final
+-- amount for that sale only — never a change to the product's own price.
+-- `final_price` records that overridden line subtotal (pre-GST) for
+-- audit/reporting; NULL means the line used the normal price × quantity
+-- calculation. `line_total` (existing column) always holds the actual
+-- amount charged either way, so every existing read path keeps working
+-- unchanged.
+ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS final_price NUMERIC(10, 2);
