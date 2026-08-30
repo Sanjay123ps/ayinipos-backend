@@ -1414,5 +1414,65 @@
     "lowStockLimit": 10,
     "barcode": "8901001118",
     "emoji": "🌾"
+  },
+  {
+    "id": "P119",
+    "name": "Kollu Podi 50g",
+    "category": "Masala Items",
+    "price":25,
+    "purchasePrice": 0,
+    "gst": 0,
+    "stock": 50,
+    "lowStockLimit": 10,
+    "barcode": "8901001119",
+    "emoji": "🌾"
+  },
+  {
+    "id": "P120",
+    "name": "Ulundhu Podi 50g",
+    "category": "Masala Items",
+    "price": 25,
+    "purchasePrice": 0,
+    "gst": 0,
+    "stock": 50,
+    "lowStockLimit": 10,
+    "barcode": "8901001120",
+    "emoji": "🌾"
+  },
+  {
+    "id": "P121",
+    "name": "Red Chilli 100g",
+    "category": "Pulses",
+    "price": 35,
+    "purchasePrice": 0,
+    "gst": 0,
+    "stock": 50,
+    "lowStockLimit": 10,
+    "barcode": "8901001121",
+    "emoji": "🌾"
+  },
+   {
+    "id": "P122",
+    "name": "Murunga Keerai Thokku 100g",
+    "category": "Masala Items",
+    "price": 50,
+    "purchasePrice": 0,
+    "gst": 0,
+    "stock": 50,
+    "lowStockLimit": 10,
+    "barcode": "8901001122",
+    "emoji": "🌾"
+  },
+  {
+    "id": "P123",
+    "name": "Karuvepillai  Thokku 100g",
+    "category": "Masala Items",
+    "price": 50,
+    "purchasePrice": 0,
+    "gst": 0,
+    "stock": 50,
+    "lowStockLimit": 10,
+    "barcode": "8901001123",
+    "emoji": "🌾"
   }
 ]
