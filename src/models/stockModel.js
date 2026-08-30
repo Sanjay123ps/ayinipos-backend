@@ -4,6 +4,14 @@ import { pool } from '../config/db.js'
 // Pass a transaction `client` when calling this from inside withTransaction;
 // defaults to the pool for standalone calls (e.g. manual adjustments).
 export async function applyStockDelta(productId, delta, reason, client = pool) {
+  if (!Number.isInteger(delta)) {
+    const err = new Error(
+      `Stock delta must be a whole number (got ${delta}). This product may not track stock, or the caller forgot to check track_stock.`
+    )
+    err.status = 400
+    throw err
+  }
+
   const { rows } = await client.query(
     `UPDATE products SET stock = GREATEST(stock + $1, 0), updated_at = now()
      WHERE id = $2

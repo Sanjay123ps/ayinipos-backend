@@ -21,6 +21,21 @@ export async function createSale({ items, discountPercent, customerMobile, custo
     throw err
   }
 
+  // sales.discount_percent is NUMERIC(5,2) (max 999.99). Unlike every other
+  // price-affecting input here, this one came straight from the request
+  // body with no range check, which let a value of 100-999.99 produce a
+  // negative bill total, a value >= 1000 throw a raw Postgres "numeric
+  // field overflow" 500, and a negative value inflate the total instead of
+  // discounting it.
+  if (discountPercent !== undefined && discountPercent !== null) {
+    const parsedDiscount = Number(discountPercent)
+    if (!Number.isFinite(parsedDiscount) || parsedDiscount < 0 || parsedDiscount > 100) {
+      const err = new Error('discountPercent must be a number between 0 and 100')
+      err.status = 400
+      throw err
+    }
+  }
+
   return withTransaction(async (client) => {
     let subtotal = 0
     let gstAmount = 0

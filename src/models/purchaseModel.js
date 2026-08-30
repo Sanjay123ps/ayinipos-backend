@@ -78,6 +78,14 @@ export async function getPurchaseByNo(billNo) {
   }
 }
 
+// Mirrors saleModel.createSale's guard: weight-priced/service products have
+// track_stock = false and must never have their stock column touched, the
+// same way sales already skip them via `if (line.trackStock)`.
+async function isStockTracked(productId, client) {
+  const { rows } = await client.query('SELECT track_stock FROM products WHERE id = $1', [productId])
+  return rows[0]?.track_stock === true
+}
+
 function buildLines(items) {
   if (!items || items.length === 0) {
     const err = new Error('A purchase bill needs at least one product')
@@ -126,7 +134,7 @@ async function insertLines(client, purchaseId, billNo, lines, reasonSuffix = '')
        VALUES ($1,$2,$3,$4,$5,$6,0,0,$7,$7,$8)`,
       [purchaseId, line.productId, line.productName, line.unit, line.quantity, line.purchasePrice, line.lineTotal, line.productType]
     )
-    if (line.productId) {
+    if (line.productId && (await isStockTracked(line.productId, client))) {
       await applyStockDelta(line.productId, line.quantity, `Purchase ${billNo}${reasonSuffix}`, client)
     }
   }
@@ -172,13 +180,14 @@ export async function updatePurchase(billNo, { supplier, invoiceNo, date, items,
     const purchaseId = rows[0].id
 
     const { rows: oldItems } = await client.query(
-      'SELECT product_id, quantity FROM purchase_items WHERE purchase_id = $1',
+      `SELECT pi.product_id, pi.quantity
+       FROM purchase_items pi
+       JOIN products p ON p.id = pi.product_id
+       WHERE pi.purchase_id = $1 AND p.track_stock`,
       [purchaseId]
     )
     for (const item of oldItems) {
-      if (item.product_id) {
-        await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} edited`, client)
-      }
+      await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} edited`, client)
     }
     await client.query('DELETE FROM purchase_items WHERE purchase_id = $1', [purchaseId])
 
@@ -210,13 +219,14 @@ export async function deletePurchase(billNo) {
     const purchaseId = rows[0].id
 
     const { rows: items } = await client.query(
-      'SELECT product_id, quantity FROM purchase_items WHERE purchase_id = $1',
+      `SELECT pi.product_id, pi.quantity
+       FROM purchase_items pi
+       JOIN products p ON p.id = pi.product_id
+       WHERE pi.purchase_id = $1 AND p.track_stock`,
       [purchaseId]
     )
     for (const item of items) {
-      if (item.product_id) {
-        await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} deleted`, client)
-      }
+      await applyStockDelta(item.product_id, -Number(item.quantity), `Purchase ${billNo} deleted`, client)
     }
 
     await client.query('DELETE FROM purchases WHERE id = $1', [purchaseId])

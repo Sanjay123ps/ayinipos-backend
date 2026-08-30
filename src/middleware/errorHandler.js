@@ -11,11 +11,7 @@ export function errorHandler(err, req, res, next) {
   // often something unexpected — a raw Postgres error, for instance — which
   // can include column/constraint names. In production those get replaced
   // with a generic message; the real error is still logged above either way.
-  // TEMP DEBUG: always exposing the real message (even on 500 in prod) to
-  // diagnose the delete-bill 500 without needing Render log access. Revert
-  // this line back to `status < 500 || process.env.NODE_ENV !== 'production'`
-  // once the cause is found.
-  const exposeMessage = true
+  const exposeMessage = status < 500 || process.env.NODE_ENV !== 'production'
 
   res.status(status).json({
     error: exposeMessage ? err.message || 'Something went wrong' : 'Something went wrong. Please try again.',
